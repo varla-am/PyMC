@@ -1,0 +1,11 @@
+name: PyMC
+version: '${version}'
+main: com.varlaam.pymc.PyMCPlugin
+loader: com.varlaam.pymc.PyMCLoader
+api-version: '1.21'
+description: Commands for Paper written in Python 3
+author: Varlaam
+permissions:
+  pymc.admin:
+    description: Use /pymc reload and /pymc list
+    default: op

@@ -1,0 +1,14 @@
+# Which Python runs the scripts:
+#   auto    - python3 if this machine has Python 3.9+, otherwise GraalPy inside the server
+#   python  - always the python3 below (fast, any library; needs Python on the machine)
+#   graalpy - always GraalPy (works on any host; ~150 MB download on first start)
+engine: auto
+
+# Python interpreter for the "python" engine
+python: python3
+
+# Seconds a script may run before PyMC stops it
+script-timeout: 30
+
+# How many scripts may run at once; extra uses of a command are refused
+max-running-scripts: 8
