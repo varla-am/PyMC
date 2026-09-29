@@ -6,8 +6,10 @@ import java.io.IOException;
 import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Deque;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -19,7 +21,6 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Logger;
 
-import com.google.gson.Gson;
 import org.bukkit.Bukkit;
 import org.bukkit.command.CommandSender;
 import org.graalvm.polyglot.Context;
@@ -39,7 +40,6 @@ import org.graalvm.polyglot.io.IOAccess;
  * libraries are on the classpath (see PyMCLoader), and only created via reflection.
  */
 final class GraalEngine implements ScriptEngine {
-    private static final Gson GSON = new Gson();
     private static final int DISCOVER_TIMEOUT_SECONDS = 10;
 
     private static Engine shared;
@@ -90,52 +90,51 @@ final class GraalEngine implements ScriptEngine {
     }
 
     @Override
-    public Registration probe(Path script) {
+    public Probe probe(Path script) {
         String file = script.getFileName().toString();
         ScriptHost host = new ScriptHost(requests, null);
-        try (Context ctx = newContext(script, Map.of("PYMC_MODE", "discover"), host)) {
+        LogStream output = new LogStream(file);
+        try (Context ctx = newContext(script, Map.of("PYMC_MODE", "discover"), host, output)) {
             ScheduledFuture<?> dog = WATCHDOGS.schedule(() -> ctx.close(true), DISCOVER_TIMEOUT_SECONDS, TimeUnit.SECONDS);
             try {
                 exec(ctx, script);
             } catch (PolyglotException e) {
                 if (e.isCancelled()) {
-                    logger().warning(file + " did not reach mcmod.triggerCommand(...) within "
-                            + DISCOVER_TIMEOUT_SECONDS + " s, skipped");
-                    return null;
+                    return Probe.failed("did not reach mcmod.triggerCommand(...) or mcmod.event(...) within "
+                            + DISCOVER_TIMEOUT_SECONDS + " s");
                 }
                 if (!e.isExit()) {
                     logTraceback(file, e);
+                    if (host.registration() == null) {
+                        return Probe.failed(where(file, e) + e.getMessage());
+                    }
+                } else if (e.getExitStatus() != 0 && host.registration() == null) {
+                    return Probe.failed(ScriptEngine.describe(output.recent(), file));
                 }
             } finally {
                 dog.cancel(false);
             }
         } catch (IOException | RuntimeException e) {
-            logger().severe("Cannot run " + file + " with GraalPy: " + e);
-            return null;
+            return Probe.failed("cannot run with GraalPy: " + e);
         }
         if (host.registration() == null) {
-            logger().warning(file + " never calls mcmod.triggerCommand(...), skipped");
+            return Probe.failed("never calls mcmod.triggerCommand(...) or mcmod.event(...)");
         }
-        return host.registration();
+        return Probe.ok(host.registration());
     }
 
     @Override
-    public void run(String command, Path script, CommandSender sender, String[] args) {
+    public boolean start(Path script, CommandSender sender, Map<String, String> env) {
         String file = script.getFileName().toString();
         if (starting.get() + running.size() >= maxRunning) {
-            sender.sendMessage("Too many PyMC scripts are running, try again in a moment");
-            return;
+            return false;
         }
         starting.incrementAndGet();
         Bukkit.getScheduler().runTaskAsynchronously(plugin, () -> {
             ScriptHost host = new ScriptHost(requests, sender);
             Context ctx;
             try {
-                ctx = newContext(script, Map.of(
-                        "PYMC_MODE", "run",
-                        "PYMC_COMMAND", command,
-                        "PYMC_SENDER", sender.getName(),
-                        "PYMC_ARGS", GSON.toJson(args)), host);
+                ctx = newContext(script, env, host, new LogStream(file));
             } catch (RuntimeException e) {
                 starting.decrementAndGet();
                 logger().severe("Cannot start GraalPy for " + file + ": " + e);
@@ -169,6 +168,7 @@ final class GraalEngine implements ScriptEngine {
                 }
             }
         });
+        return true;
     }
 
     @Override
@@ -183,7 +183,7 @@ final class GraalEngine implements ScriptEngine {
         running.clear();
     }
 
-    private Context newContext(Path script, Map<String, String> env, ScriptHost host) {
+    private Context newContext(Path script, Map<String, String> env, ScriptHost host, LogStream output) {
         Path scriptsDir = script.toAbsolutePath().getParent();
         Context ctx = Context.newBuilder("python")
                 .engine(shared)
@@ -195,8 +195,8 @@ final class GraalEngine implements ScriptEngine {
                 .environment(env)
                 .currentWorkingDirectory(scriptsDir)
                 .option("python.PythonPath", pythonDir.toAbsolutePath() + File.pathSeparator + scriptsDir)
-                .out(new LogStream(script.getFileName().toString()))
-                .err(new LogStream(script.getFileName().toString()))
+                .out(output)
+                .err(output)
                 .build();
         ctx.getPolyglotBindings().putMember("pymc_host", host);
         return ctx;
@@ -204,6 +204,20 @@ final class GraalEngine implements ScriptEngine {
 
     private static void exec(Context ctx, Path script) throws IOException {
         ctx.eval(Source.newBuilder("python", script.toFile()).build());
+    }
+
+    /** "line 3: " - where in the script itself an exception happened, if GraalPy knows. */
+    private static String where(String file, PolyglotException e) {
+        if (e.isSyntaxError() && e.getSourceLocation() != null) {
+            return "line " + e.getSourceLocation().getStartLine() + ": ";
+        }
+        for (PolyglotException.StackFrame frame : e.getPolyglotStackTrace()) {
+            SourceSection at = frame.getSourceLocation();
+            if (frame.isGuestFrame() && at != null && file.equals(at.getSource().getName())) {
+                return "line " + at.getStartLine() + ": ";
+            }
+        }
+        return "";
     }
 
     /** Formats a GraalPy exception like a CPython traceback, one log line per line. */
@@ -224,10 +238,12 @@ final class GraalEngine implements ScriptEngine {
         logger().info("[" + file + "] " + e.getMessage());
     }
 
-    /** A context's stdout/stderr, logged line by line with the script name. */
+    /** A context's stdout/stderr, logged line by line with the script name; keeps the last lines. */
     private final class LogStream extends OutputStream {
+        private static final int KEEP = 50;
         private final String file;
         private final ByteArrayOutputStream line = new ByteArrayOutputStream();
+        private final Deque<String> recent = new ArrayDeque<>();
 
         LogStream(String file) {
             this.file = file;
@@ -249,6 +265,13 @@ final class GraalEngine implements ScriptEngine {
             }
         }
 
+        synchronized List<String> recent() {
+            if (line.size() > 0) {
+                emit();
+            }
+            return new ArrayList<>(recent);
+        }
+
         @Override
         public synchronized void close() {
             if (line.size() > 0) {
@@ -259,7 +282,12 @@ final class GraalEngine implements ScriptEngine {
         private void emit() {
             String text = line.toString(StandardCharsets.UTF_8);
             line.reset();
-            logger().info("[" + file + "] " + (text.endsWith("\r") ? text.substring(0, text.length() - 1) : text));
+            text = text.endsWith("\r") ? text.substring(0, text.length() - 1) : text;
+            recent.addLast(text);
+            if (recent.size() > KEEP) {
+                recent.removeFirst();
+            }
+            logger().info("[" + file + "] " + text);
         }
     }
 }

@@ -1,4 +1,5 @@
-"""The command that started this script, the switch that declares it, and server info."""
+"""What started this script (a command or an event), the calls that declare it, and server info."""
+import difflib
 import json
 import keyword
 import os
@@ -11,6 +12,13 @@ from . import _bridge
 command = os.environ.get("PYMC_COMMAND", "")
 sender = os.environ.get("PYMC_SENDER", "CONSOLE")
 args = json.loads(os.environ.get("PYMC_ARGS", "[]"))
+
+# Keep in sync with EventBridge.EVENTS on the Java side.
+EVENTS = (
+    "load", "join", "first_join", "quit", "chat", "command", "death", "respawn", "kill", "damage",
+    "break", "place", "right_click", "left_click", "drop", "pickup", "consume", "bed_enter",
+    "world_change", "level_change", "gamemode_change",
+)
 
 # {name} required, [name] optional, a trailing "..." takes the rest of the line
 _ARG = re.compile(r"\{(\w+)(\.\.\.)?\}|\[(\w+)(\.\.\.)?\]")
@@ -58,6 +66,68 @@ def triggerCommand(pattern):
 
     caller.update(values)
     return SimpleNamespace(**values)
+
+
+def event(*names):
+    """Declare the server events this script runs on, like Skript's "on join:":
+
+        e = mcmod.event("join")
+        mcmod.reply(f"&aWelcome, {e.player}!")
+
+        e = mcmod.event("break", "place")     # several events, e.name says which one
+        e = mcmod.event("on first join")      # Skript spelling works too
+
+    The rest of the script runs every time one of the events happens. The result has the
+    event's details as attributes: e.name, e.player (the player's name, None for "load"),
+    plus per event e.g. e.message (chat), e.block, e.x, e.y, e.z (break/place), e.killer
+    (death). mcmod.sender is the player, so mcmod.reply(...) messages them.
+
+    Events: load, join, first_join, quit, chat, command, death, respawn, kill, damage,
+    break, place, right_click, left_click, drop, pickup, consume, bed_enter, world_change,
+    level_change, gamemode_change. The script runs just after the event, so it can react
+    to it but not cancel it.
+    """
+    wanted = []
+    for n in names:
+        name = _event_name(n)
+        if name not in wanted:
+            wanted.append(name)
+    if not wanted:
+        raise ValueError("mcmod.event needs at least one event, e.g. mcmod.event(\"join\")")
+
+    if _bridge.MODE == "discover":
+        _bridge.send("register", events=wanted)
+        sys.exit(0)
+
+    if _bridge.MODE == "offline":
+        # Dry run: details can be given in PYMC_EVENT_DATA, any other field reads as None.
+        data = {"name": wanted[0], "player": None if sender == "CONSOLE" else sender,
+                **json.loads(os.environ.get("PYMC_EVENT_DATA", "{}"))}
+        print(f"[pymc offline] on {wanted[0]}: {data}")
+        return _OfflineEvent(**data)
+
+    fired = os.environ.get("PYMC_EVENT")
+    if not fired:
+        raise RuntimeError("this script was started by a command, but it declares events - "
+                           "a script is either a command or an event handler")
+    return _ns({"name": fired, **json.loads(os.environ.get("PYMC_EVENT_DATA", "{}"))})
+
+
+def _event_name(name):
+    """ "on first join", "First-Join", "first_join" -> "first_join"."""
+    text = str(name).strip().lower()
+    text = re.sub(r"^on\s+", "", text)
+    text = re.sub(r"[\s\-]+", "_", text).rstrip(":")
+    if text not in EVENTS:
+        close = difflib.get_close_matches(text, EVENTS, n=2)
+        hint = f"did you mean {' or '.join(close)}? " if close else ""
+        raise ValueError(f"unknown event {name!r} - {hint}Known events: {', '.join(EVENTS)}")
+    return text
+
+
+class _OfflineEvent(SimpleNamespace):
+    def __getattr__(self, name):
+        return None
 
 
 def _parse(pattern):

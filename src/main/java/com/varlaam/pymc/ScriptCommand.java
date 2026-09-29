@@ -23,7 +23,9 @@ final class ScriptCommand extends Command {
 
     @Override
     public boolean execute(CommandSender sender, String label, String[] args) {
-        runner.run(getName(), script, sender, args);
+        if (!runner.start(script, sender, ScriptEngine.commandEnv(getName(), sender, args))) {
+            sender.sendMessage("Too many PyMC scripts are running, try again in a moment");
+        }
         return true;
     }
 }

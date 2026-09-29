@@ -35,9 +35,9 @@ public final class ScriptHost {
 
     @HostAccess.Export
     public void send(String line) {
-        JsonObject msg = Requests.parse(line);
-        if (msg != null && "register".equals(Requests.str(msg, "type"))) {
-            registration = new ScriptEngine.Registration(Requests.str(msg, "command"), Requests.str(msg, "usage"));
+        ScriptEngine.Registration reg = ScriptEngine.Registration.of(Requests.parse(line));
+        if (reg != null) {
+            registration = reg;
         }
     }
 }
