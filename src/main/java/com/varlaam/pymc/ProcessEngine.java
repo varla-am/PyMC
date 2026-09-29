@@ -173,6 +173,11 @@ final class ProcessEngine implements ScriptEngine {
                 + (inherited == null || inherited.isEmpty() ? "" : File.pathSeparator + inherited));
         env.put("PYTHONIOENCODING", "utf-8");
         env.put("PYTHONUNBUFFERED", "1");
+        // Python 3.13+ colours tracebacks when FORCE_COLOR is set; the escape codes would end up
+        // in chat and break the "line N:" parsing of errors.
+        env.remove("FORCE_COLOR");
+        env.put("PYTHON_COLORS", "0");
+        env.put("NO_COLOR", "1");
         return builder.start();
     }
 
