@@ -8,6 +8,9 @@ import java.io.InputStreamReader;
 import java.io.OutputStreamWriter;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
@@ -15,7 +18,6 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Logger;
 
-import com.google.gson.Gson;
 import com.google.gson.JsonObject;
 import org.bukkit.Bukkit;
 import org.bukkit.command.CommandSender;
@@ -26,7 +28,6 @@ import org.bukkit.scheduler.BukkitTask;
  * writes requests to stdout and reads replies from stdin, its stderr goes to the log.
  */
 final class ProcessEngine implements ScriptEngine {
-    private static final Gson GSON = new Gson();
     private static final int DISCOVER_TIMEOUT_SECONDS = 10;
 
     private final PyMCPlugin plugin;
@@ -37,6 +38,7 @@ final class ProcessEngine implements ScriptEngine {
     private final int maxRunning;
     private final Set<Process> running = ConcurrentHashMap.newKeySet();
     private final AtomicInteger starting = new AtomicInteger();
+    private volatile String name;
 
     ProcessEngine(PyMCPlugin plugin, Requests requests, String python, Path pythonDir,
                   int timeoutSeconds, int maxRunning) {
@@ -50,7 +52,11 @@ final class ProcessEngine implements ScriptEngine {
 
     @Override
     public String name() {
-        return "Python " + PythonProbe.version(python) + " (" + python + ")";
+        // Asking python3 for its version starts a process; do it once, not on every /pymc version.
+        if (name == null) {
+            name = "Python " + PythonProbe.version(python) + " (" + python + ")";
+        }
+        return name;
     }
 
     @Override
@@ -59,65 +65,69 @@ final class ProcessEngine implements ScriptEngine {
     }
 
     @Override
-    public Registration probe(Path script) {
+    public Probe probe(Path script) {
         String file = script.getFileName().toString();
         try {
             Process process = start(script, Map.of("PYMC_MODE", "discover"));
-            pipeStderr(process, file);
+            List<String> output = Collections.synchronizedList(new ArrayList<>());
+            Thread stderr = pipeStderr(process, file, output);
             if (!process.waitFor(DISCOVER_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
                 process.destroyForcibly();
-                logger().warning(file + " did not reach mcmod.triggerCommand(...) within "
-                        + DISCOVER_TIMEOUT_SECONDS + " s, skipped");
-                return null;
+                return Probe.failed("did not reach mcmod.triggerCommand(...) or mcmod.event(...) within "
+                        + DISCOVER_TIMEOUT_SECONDS + " s");
             }
             Registration reg = null;
             try (BufferedReader out = reader(process)) {
                 String line;
                 while ((line = out.readLine()) != null) {
-                    JsonObject msg = Requests.parse(line);
-                    if (msg != null && "register".equals(Requests.str(msg, "type"))) {
-                        reg = new Registration(Requests.str(msg, "command"), Requests.str(msg, "usage"));
+                    Registration r = Registration.of(Requests.parse(line));
+                    if (r != null) {
+                        reg = r;
                     }
                 }
             }
-            if (reg == null) {
-                logger().warning(file + " never calls mcmod.triggerCommand(...), skipped");
+            stderr.join(1000);
+            if (reg != null) {
+                return Probe.ok(reg);
             }
-            return reg;
+            if (process.exitValue() != 0) {
+                synchronized (output) {
+                    return Probe.failed(ScriptEngine.describe(output, file));
+                }
+            }
+            return Probe.failed("never calls mcmod.triggerCommand(...) or mcmod.event(...)");
         } catch (IOException e) {
-            logger().severe("Cannot start '" + python + "' for " + file + ": " + e.getMessage());
+            return Probe.failed("cannot start '" + python + "': " + e.getMessage());
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
+            return Probe.failed("interrupted");
         }
-        return null;
     }
 
     @Override
-    public void run(String command, Path script, CommandSender sender, String[] args) {
+    public boolean start(Path script, CommandSender sender, Map<String, String> env) {
         String file = script.getFileName().toString();
         // Every use is a python3 process; without a cap, spamming a command forks without limit.
         if (starting.get() + running.size() >= maxRunning) {
-            sender.sendMessage("Too many PyMC scripts are running, try again in a moment");
-            return;
+            return false;
         }
         starting.incrementAndGet();
         Bukkit.getScheduler().runTaskAsynchronously(plugin, () -> {
             Process process;
             try {
-                process = start(script, Map.of(
-                        "PYMC_MODE", "run",
-                        "PYMC_COMMAND", command,
-                        "PYMC_SENDER", sender.getName(),
-                        "PYMC_ARGS", GSON.toJson(args)));
+                process = start(script, env);
             } catch (IOException e) {
                 starting.decrementAndGet();
                 logger().severe("Cannot start '" + python + "' for " + file + ": " + e.getMessage());
-                Bukkit.getScheduler().runTask(plugin, () -> sender.sendMessage("/" + command + " failed to start"));
+                String command = env.get("PYMC_COMMAND");
+                if (command != null) {
+                    Bukkit.getScheduler().runTask(plugin, () -> sender.sendMessage("/" + command + " failed to start"));
+                }
                 return;
             }
             running.add(process);
             starting.decrementAndGet();
-            pipeStderr(process, file);
+            pipeStderr(process, file, null);
             BukkitTask watchdog = Bukkit.getScheduler().runTaskLaterAsynchronously(plugin, () -> {
                 if (process.isAlive()) {
                     process.destroyForcibly();
@@ -144,6 +154,7 @@ final class ProcessEngine implements ScriptEngine {
                 watchdog.cancel();
             }
         });
+        return true;
     }
 
     @Override
@@ -162,17 +173,28 @@ final class ProcessEngine implements ScriptEngine {
                 + (inherited == null || inherited.isEmpty() ? "" : File.pathSeparator + inherited));
         env.put("PYTHONIOENCODING", "utf-8");
         env.put("PYTHONUNBUFFERED", "1");
+        // Python 3.13+ colours tracebacks when FORCE_COLOR is set; the escape codes would end up
+        // in chat and break the "line N:" parsing of errors.
+        env.remove("FORCE_COLOR");
+        env.put("PYTHON_COLORS", "0");
+        env.put("NO_COLOR", "1");
         return builder.start();
     }
 
-    /** Script output and tracebacks go to the server console, prefixed with the file name. */
-    private void pipeStderr(Process process, String file) {
+    /**
+     * Script output and tracebacks go to the server console, prefixed with the file name.
+     * If keep is given, the lines are also collected there (discovery reports errors from them).
+     */
+    private Thread pipeStderr(Process process, String file, List<String> keep) {
         Thread thread = new Thread(() -> {
             try (BufferedReader err = new BufferedReader(
                     new InputStreamReader(process.getErrorStream(), StandardCharsets.UTF_8))) {
                 String line;
                 while ((line = err.readLine()) != null) {
                     logger().info("[" + file + "] " + line);
+                    if (keep != null) {
+                        keep.add(line);
+                    }
                 }
             } catch (IOException ignored) {
                 // process ended
@@ -180,6 +202,7 @@ final class ProcessEngine implements ScriptEngine {
         }, "PyMC-" + file);
         thread.setDaemon(true);
         thread.start();
+        return thread;
     }
 
     private static BufferedReader reader(Process process) {

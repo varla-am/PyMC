@@ -8,8 +8,8 @@ On the process transport stdout belongs to the protocol, so print() output is mo
 stderr, which the plugin copies into the server console.
 
 Modes (PYMC_MODE):
-    discover  the server asks which command the script answers to
-    run       someone used the command, execute the script
+    discover  the server asks which command or events the script answers to
+    run       someone used the command or an event happened, execute the script
     offline   run straight from a terminal: requests are printed, not sent
 """
 import json
@@ -52,9 +52,15 @@ def request(kind, **payload):
         print(f"[pymc offline] {kind}: {payload}")
         return None
     if MODE == "discover":
-        # The server is only asking which command this is; nothing may run yet.
-        print("pymc: the script does something before mcmod.triggerCommand(...) - "
-              "call triggerCommand first")
+        # The server is only asking which command or events this is; nothing may run yet.
+        # Point at the script's own line, PyMC reports it with /pymc reload.
+        frame = sys._getframe(1)
+        while frame is not None and frame.f_globals.get("__name__", "").startswith("pymc"):
+            frame = frame.f_back
+        if frame is not None:
+            print(f'  File "{frame.f_code.co_filename}", line {frame.f_lineno}')
+        print(f"pymc: the script uses {kind!r} before mcmod.triggerCommand(...) or mcmod.event(...) - "
+              "declare the command or events first")
         sys.exit(2)
     _next_id += 1
     line = _line(kind, {"id": _next_id, **payload})

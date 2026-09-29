@@ -10,5 +10,6 @@ python: python3
 # Seconds a script may run before PyMC stops it
 script-timeout: 30
 
-# How many scripts may run at once; extra uses of a command are refused
+# How many scripts may run at once; extra uses of a command are refused,
+# extra events are skipped (with a warning in the log)
 max-running-scripts: 8

@@ -3,7 +3,7 @@ plugins {
 }
 
 group = "com.varlaam"
-version = "2.0.0"
+version = "3.0.0-alpha"
 
 repositories {
     mavenCentral()
